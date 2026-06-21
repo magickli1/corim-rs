@@ -10,6 +10,7 @@ use openssl::{
     nid::Nid,
     pkey::PKey,
     sign::{Signer, Verifier},
+    x509::X509Ref,
 };
 
 /// A limited implementation of a COSE signer using openssl crate that support EC2 keys, and
@@ -52,6 +53,25 @@ impl OpensslSigner {
 
     pub fn public_key_from_pem(bytes: &[u8]) -> Result<Self, CorimError> {
         let ec_key = EcKey::public_key_from_pem(bytes)?;
+        Self::from_ec_public_key(&ec_key)
+    }
+
+    /// Build a verifier from the public key in a DER-encoded X.509 certificate.
+    pub fn public_key_from_x509_der(der: &[u8]) -> Result<Self, CorimError> {
+        let cert = openssl::x509::X509::from_der(der)?;
+        Self::public_key_from_x509(&cert)
+    }
+
+    /// Build a verifier from the public key in an X.509 certificate.
+    pub fn public_key_from_x509(cert: &X509Ref) -> Result<Self, CorimError> {
+        let pkey = cert.public_key()?;
+        let ec_key = pkey
+            .ec_key()
+            .map_err(|_| CorimError::custom("unsupported key type in x5chain"))?;
+        Self::from_ec_public_key(&ec_key)
+    }
+
+    fn from_ec_public_key(ec_key: &EcKey<openssl::pkey::Public>) -> Result<Self, CorimError> {
         let group = ec_key.group();
 
         let crv = match group.curve_name() {
