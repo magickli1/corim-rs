@@ -292,20 +292,34 @@ fn check_revocation(chain: &[X509], crls: &[X509Crl], now_secs: i64) -> Result<(
             continue;
         }
 
-        for crl in &issuer_crls {
-            check_crl_validity(crl, now_secs)?;
-        }
-
         let serial = cert
             .serial_number()
             .to_bn()
             .map_err(|e| CorimError::custom(format!("reading certificate serial: {e}")))?;
 
-        if serial_revoked(&serial, &issuer_crls) {
-            let subject = x509_name_string(cert.subject_name());
-            return Err(CorimError::custom(format!(
-                "x5chain: certificate {subject:?} is revoked"
-            )));
+        let mut validity_err: Option<CorimError> = None;
+        let mut valid_crl_found = false;
+
+        for crl in &issuer_crls {
+            if let Err(e) = check_crl_validity(crl, now_secs) {
+                validity_err = Some(e);
+                continue;
+            }
+
+            valid_crl_found = true;
+
+            if serial_revoked(&serial, std::slice::from_ref(crl)) {
+                let subject = x509_name_string(cert.subject_name());
+                return Err(CorimError::custom(format!(
+                    "x5chain: certificate {subject:?} is revoked"
+                )));
+            }
+        }
+
+        if !valid_crl_found {
+            if let Some(e) = validity_err {
+                return Err(e);
+            }
         }
     }
 
@@ -883,12 +897,11 @@ mod tests {
             }
         }
 
-        pub(super) fn make_expired_crl() -> X509Crl {
+        pub(super) fn make_expired_crl(ca: &X509, ca_key: &PKey<Private>) -> X509Crl {
             unsafe {
-                let issuer = ca_name();
                 let crl = ffi::X509_CRL_new();
                 assert!(!crl.is_null());
-                ffi::X509_CRL_set_issuer_name(crl, issuer.as_ptr());
+                ffi::X509_CRL_set_issuer_name(crl, ca.subject_name().as_ptr());
 
                 let now = unix_now();
                 let this_update = Asn1Time::from_unix(now - 7_200).unwrap();
@@ -896,9 +909,95 @@ mod tests {
                 let next_update = Asn1Time::from_unix(now - 3_600).unwrap();
                 ffi::X509_CRL_set1_nextUpdate(crl, next_update.as_ptr());
 
+                assert!(
+                    ffi::X509_CRL_sign(crl, ca_key.as_ptr(), MessageDigest::sha256().as_ptr()) > 0,
+                    "CRL signing failed"
+                );
+
                 X509Crl::from_ptr(crl)
             }
         }
+
+        pub(super) fn make_valid_empty_crl(ca: &X509, ca_key: &PKey<Private>) -> X509Crl {
+            unsafe {
+                let crl = ffi::X509_CRL_new();
+                assert!(!crl.is_null());
+                ffi::X509_CRL_set_issuer_name(crl, ca.subject_name().as_ptr());
+
+                let now = unix_now();
+                let this_update = Asn1Time::from_unix(now - 60).unwrap();
+                ffi::X509_CRL_set1_lastUpdate(crl, this_update.as_ptr());
+                let next_update = Asn1Time::from_unix(now + 3_600).unwrap();
+                ffi::X509_CRL_set1_nextUpdate(crl, next_update.as_ptr());
+
+                assert!(
+                    ffi::X509_CRL_sign(crl, ca_key.as_ptr(), MessageDigest::sha256().as_ptr()) > 0,
+                    "CRL signing failed"
+                );
+
+                X509Crl::from_ptr(crl)
+            }
+        }
+    }
+
+    #[test]
+    fn check_revocation_valid_crl_ignores_expired_sibling() {
+        use crl_helpers::{make_ca, make_expired_crl, make_leaf, make_valid_empty_crl};
+
+        let (ca, ca_key) = make_ca();
+        let leaf = make_leaf(&ca, &ca_key);
+        let expired_crl = make_expired_crl(&ca, &ca_key);
+        let valid_crl = make_valid_empty_crl(&ca, &ca_key);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        check_revocation(&[leaf, ca.clone()], &[expired_crl, valid_crl], now)
+            .expect("valid CRL must satisfy issuer even when an expired sibling exists");
+    }
+
+    #[test]
+    fn check_revocation_revoked_before_expired_crl() {
+        use crl_helpers::{make_ca, make_crl_revoking_leaf, make_expired_crl, make_leaf};
+
+        let (ca, ca_key) = make_ca();
+        let leaf = make_leaf(&ca, &ca_key);
+        let expired_crl = make_expired_crl(&ca, &ca_key);
+        let revoked_crl = make_crl_revoking_leaf(&ca, &ca_key, &leaf);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let err = check_revocation(&[leaf, ca], &[expired_crl, revoked_crl], now).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("revoked"), "unexpected error: {msg}");
+        assert!(
+            !msg.contains("expired"),
+            "revocation must win over expired sibling CRL: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_revocation_all_matching_crls_expired() {
+        use crl_helpers::{make_ca, make_expired_crl, make_leaf};
+
+        let (ca, ca_key) = make_ca();
+        let leaf = make_leaf(&ca, &ca_key);
+        let expired_crl1 = make_expired_crl(&ca, &ca_key);
+        let expired_crl2 = make_expired_crl(&ca, &ca_key);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let err =
+            check_revocation(&[leaf, ca], &[expired_crl1, expired_crl2], now).unwrap_err();
+        assert!(
+            err.to_string().contains("expired"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -922,9 +1021,10 @@ mod tests {
 
     #[test]
     fn check_crl_validity_rejects_expired() {
-        use crl_helpers::make_expired_crl;
+        use crl_helpers::{make_ca, make_expired_crl};
 
-        let crl = make_expired_crl();
+        let (ca, ca_key) = make_ca();
+        let crl = make_expired_crl(&ca, &ca_key);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -942,7 +1042,8 @@ mod tests {
 
         let (ca, ca_key) = make_ca();
         let leaf = make_leaf(&ca, &ca_key);
-        let expired_crl = make_expired_crl();
+        let (unrelated_ca, unrelated_key) = make_ca();
+        let expired_crl = make_expired_crl(&unrelated_ca, &unrelated_key);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
