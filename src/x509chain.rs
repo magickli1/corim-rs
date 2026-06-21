@@ -51,49 +51,70 @@ impl TrustedRoots {
     }
 }
 
-fn read_pem_block(buf: &[u8], expected_label: &str) -> Result<Option<Vec<u8>>, CorimError> {
-    let mut cursor = Cursor::new(buf);
-    match Pem::read(&mut cursor) {
-        Ok((pem, _)) => {
-            if pem.label != expected_label {
-                return Err(CorimError::custom(format!(
-                    "invalid PEM block type {:?}",
-                    pem.label
-                )));
-            }
-            Ok(Some(pem.contents))
-        }
-        Err(PEMError::IncompletePEM) | Err(PEMError::MissingHeader) => Ok(None),
-        Err(err) => Err(CorimError::custom(format!("reading PEM: {err}"))),
-    }
-}
-
-/// Parse a DER-encoded certificate or a PEM block of type CERTIFICATE.
+/// Parse a single DER-encoded certificate or a PEM `CERTIFICATE` block.
+/// For loading trust anchors from files (including PEM bundles with multiple
+/// certificates), use [`trusted_root_pool`] instead.
 pub fn parse_certificate_der_or_pem(data: &[u8]) -> Result<X509, CorimError> {
-    let der = if let Some(der) = read_pem_block(data, "CERTIFICATE")? {
-        der
-    } else {
-        data.to_vec()
-    };
+    if let Ok(cert) = X509::from_pem(data) {
+        return Ok(cert);
+    }
 
-    X509::from_der(&der).map_err(|e| CorimError::custom(format!("parsing certificate: {e}")))
+    X509::from_der(data).map_err(|e| CorimError::custom(format!("parsing certificate: {e}")))
 }
 
-/// Parse a DER-encoded CRL or a PEM block of type X509 CRL.
-pub fn parse_revocation_list_der_or_pem(data: &[u8]) -> Result<X509Crl, CorimError> {
-    let der = if let Some(der) = read_pem_block(data, "X509 CRL")? {
-        der
-    } else {
-        data.to_vec()
-    };
+fn parse_revocation_list_der(der: &[u8]) -> Result<X509Crl, CorimError> {
+    X509Crl::from_der(der).map_err(|e| CorimError::custom(format!("parsing CRL: {e}")))
+}
 
-    X509Crl::from_der(&der).map_err(|e| CorimError::custom(format!("parsing CRL: {e}")))
+fn crls_from_der_or_pem(data: &[u8]) -> Result<Vec<X509Crl>, CorimError> {
+    let mut cursor = Cursor::new(data);
+    let mut crls = Vec::new();
+
+    loop {
+        match Pem::read(&mut cursor) {
+            Ok((pem, _)) => {
+                if pem.label != "X509 CRL" {
+                    return Err(CorimError::custom(format!(
+                        "invalid PEM block type {:?}",
+                        pem.label
+                    )));
+                }
+                crls.push(parse_revocation_list_der(&pem.contents)?);
+            }
+            Err(PEMError::IncompletePEM) | Err(PEMError::MissingHeader) => break,
+            Err(err) => return Err(CorimError::custom(format!("reading PEM: {err}"))),
+        }
+    }
+
+    if crls.is_empty() {
+        crls.push(parse_revocation_list_der(data)?);
+    }
+
+    Ok(crls)
+}
+
+fn append_roots_from_der_or_pem(roots: &mut Vec<X509>, data: &[u8]) -> Result<(), CorimError> {
+    if let Ok(stack) = X509::stack_from_pem(data) {
+        for cert in stack.iter() {
+            push_root_deduped(roots, cert.to_owned());
+        }
+        return Ok(());
+    }
+
+    let cert = X509::from_der(data).map_err(|e| CorimError::custom(format!("parsing certificate: {e}")))?;
+    push_root_deduped(roots, cert);
+    Ok(())
 }
 
 /// Load trusted roots for x5chain validation. When `include_system_roots` is
 /// true, system root CAs are included in `roots` and certificates from
 /// `root_paths` are added; when false, only `root_paths` are trusted. CRLs are
 /// loaded from `crl_paths` when supplied.
+///
+/// Each root or CRL path may be DER or PEM. PEM root files may contain multiple
+/// certificates (via [`X509::stack_from_pem`]); DER root files hold a single
+/// certificate. PEM CRL files may contain multiple `X509 CRL` blocks (via
+/// `x509-parser` PEM splitting and [`X509Crl::from_der`]).
 ///
 /// CLI tools typically derive `include_system_roots` from
 /// [`include_system_roots_for_verify`].
@@ -130,10 +151,9 @@ where
         let data = read_file(path).map_err(|e| {
             CorimError::custom(format!("loading root certificate from {path}: {e}"))
         })?;
-        let cert = parse_certificate_der_or_pem(&data).map_err(|e| {
+        append_roots_from_der_or_pem(&mut roots, &data).map_err(|e| {
             CorimError::custom(format!("parsing root certificate from {path}: {e}"))
         })?;
-        push_root_deduped(&mut roots, cert);
     }
 
     let mut crls = Vec::new();
@@ -141,9 +161,9 @@ where
         let path = path.as_ref();
         let data = read_file(path)
             .map_err(|e| CorimError::custom(format!("loading CRL from {path}: {e}")))?;
-        let crl = parse_revocation_list_der_or_pem(&data)
+        let loaded = crls_from_der_or_pem(&data)
             .map_err(|e| CorimError::custom(format!("parsing CRL from {path}: {e}")))?;
-        crls.push(crl);
+        crls.extend(loaded);
     }
 
     Ok(TrustedRoots {
@@ -754,12 +774,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_revocation_list_der_or_pem_rejects_certificate_pem() {
-        let pem = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
-        match parse_revocation_list_der_or_pem(pem) {
-            Err(err) => assert!(err.to_string().contains("invalid PEM block type")),
-            Ok(_) => panic!("expected PEM type error"),
-        }
+    fn trusted_root_pool_loads_pem_root_bundle() {
+        let root_pem = std::fs::read(cert_path("root.cert.pem")).unwrap();
+        let int_pem = std::fs::read(cert_path("int.cert.pem")).unwrap();
+        let bundle: Vec<u8> = [root_pem.as_slice(), int_pem.as_slice()].concat();
+
+        let trusted = trusted_root_pool(
+            |_| Ok(bundle.clone()),
+            &["bundle.pem"],
+            &[] as &[&str],
+            false,
+        )
+        .unwrap();
+
+        let chain = chain_ders(&["leaf.cert.pem", "int.cert.pem"]);
+        verify_x509_chain_trust(&chain, &trusted).expect("bundle roots should verify chain");
+    }
+
+    #[test]
+    fn trusted_root_pool_invalid_pem_crl_type() {
+        let root_pem = std::fs::read(cert_path("root.cert.pem")).unwrap();
+        let bad_crl = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+        let err = match trusted_root_pool(
+            |path| match path {
+                "root.pem" => Ok(root_pem.clone()),
+                "bad.crl" => Ok(bad_crl.to_vec()),
+                _ => panic!("unexpected path {path}"),
+            },
+            &["root.pem"],
+            &["bad.crl"],
+            false,
+        ) {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected CRL parse error"),
+        };
+
+        assert!(err.contains("parsing CRL from bad.crl"), "got: {err}");
+        assert!(err.contains("invalid PEM block type"), "got: {err}");
     }
 
     mod crl_helpers {
@@ -1054,16 +1106,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_revocation_list_der_or_pem_pem_ok() {
+    fn trusted_root_pool_loads_pem_crl_file() {
         use crl_helpers::{make_ca, make_crl_revoking_leaf, make_leaf};
 
         let (ca, ca_key) = make_ca();
         let leaf = make_leaf(&ca, &ca_key);
         let crl = make_crl_revoking_leaf(&ca, &ca_key, &leaf);
         let pem = crl.to_pem().unwrap();
+        let ca_der = ca.to_der().unwrap();
 
-        let parsed = parse_revocation_list_der_or_pem(&pem).unwrap();
-        assert!(parsed.get_revoked().is_some_and(|stack| !stack.is_empty()));
+        trusted_root_pool(
+            |path| match path {
+                "root.der" => Ok(ca_der.clone()),
+                "issuer.crl" => Ok(pem.clone()),
+                _ => panic!("unexpected path {path}"),
+            },
+            &["root.der"],
+            &["issuer.crl"],
+            false,
+        )
+        .expect("PEM CRL file should load via trusted_root_pool");
     }
 
     #[test]
