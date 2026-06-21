@@ -17,10 +17,11 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 
 /// Trusted root CAs and optional CRLs for x5chain validation.
 ///
-/// `roots` holds trusted root CAs for PKIX path validation.
-/// `current_time` is used for certificate and CRL validity checks; `None` means now.
+/// `roots == None` loads system roots at verify time (like Go `TrustedRoots{Pool: nil}`).
+/// `roots == Some(vec)` uses only explicit anchors; an empty vector is explicit-trust-only.
+/// Prefer building via [`trusted_root_pool`].
 pub struct TrustedRoots {
-    roots: Vec<X509>,
+    roots: Option<Vec<X509>>,
     crls: Vec<X509Crl>,
     current_time: Option<i64>,
 }
@@ -35,7 +36,7 @@ impl TrustedRoots {
     #[cfg(test)]
     pub(crate) fn with_roots(roots: Vec<X509>) -> Self {
         Self {
-            roots,
+            roots: Some(roots),
             crls: Vec::new(),
             current_time: None,
         }
@@ -44,7 +45,7 @@ impl TrustedRoots {
     #[cfg(test)]
     pub(crate) fn with_roots_and_crls(roots: Vec<X509>, crls: Vec<X509Crl>) -> Self {
         Self {
-            roots,
+            roots: Some(roots),
             crls,
             current_time: None,
         }
@@ -101,7 +102,7 @@ fn append_roots_from_der_or_pem(roots: &mut Vec<X509>, data: &[u8]) -> Result<()
         return Ok(());
     }
 
-    let cert = X509::from_der(data).map_err(|e| CorimError::custom(format!("parsing certificate: {e}")))?;
+    let cert = parse_certificate_der_or_pem(data)?;
     push_root_deduped(roots, cert);
     Ok(())
 }
@@ -130,20 +131,7 @@ where
     let mut roots = Vec::new();
 
     if include_system_roots {
-        let native = load_native_certs();
-        if !native.errors.is_empty() {
-            let msgs: Vec<String> = native.errors.iter().map(|e| e.to_string()).collect();
-            return Err(CorimError::custom(format!(
-                "loading system cert pool: {}",
-                msgs.join("; ")
-            )));
-        }
-
-        for cert in native.certs {
-            if let Ok(parsed) = X509::from_der(cert.as_ref()) {
-                push_root_deduped(&mut roots, parsed);
-            }
-        }
+        roots.extend(load_system_roots()?);
     }
 
     for path in root_paths {
@@ -167,10 +155,30 @@ where
     }
 
     Ok(TrustedRoots {
-        roots,
+        roots: Some(roots),
         crls,
         current_time: None,
     })
+}
+
+fn load_system_roots() -> Result<Vec<X509>, CorimError> {
+    let native = load_native_certs();
+    if !native.errors.is_empty() {
+        let msgs: Vec<String> = native.errors.iter().map(|e| e.to_string()).collect();
+        return Err(CorimError::custom(format!(
+            "loading system cert pool: {}",
+            msgs.join("; ")
+        )));
+    }
+
+    let mut roots = Vec::new();
+    for cert in native.certs {
+        if let Ok(parsed) = X509::from_der(cert.as_ref()) {
+            push_root_deduped(&mut roots, parsed);
+        }
+    }
+
+    Ok(roots)
 }
 
 fn verify_cert_signed_by(cert: &X509Ref, issuer: &X509Ref) -> Result<(), CorimError> {
@@ -346,6 +354,118 @@ fn check_revocation(chain: &[X509], crls: &[X509Crl], now_secs: i64) -> Result<(
     Ok(())
 }
 
+fn verified_chain_overlap(presented: &[X509], verified: &[X509]) -> usize {
+    let presented_der: std::collections::HashSet<Vec<u8>> = presented
+        .iter()
+        .filter_map(|cert| cert_der(cert).ok())
+        .collect();
+
+    verified
+        .iter()
+        .filter(|cert| {
+            cert_der(cert)
+                .ok()
+                .is_some_and(|der| presented_der.contains(&der))
+        })
+        .count()
+}
+
+/// Prefer the PKIX result with the most x5chain (DER) overlap.
+fn select_verified_chain(presented: &[X509], verified_chains: Vec<Vec<X509>>) -> Option<Vec<X509>> {
+    if verified_chains.is_empty() {
+        return None;
+    }
+
+    let mut best_idx = 0;
+    let mut best_score = verified_chain_overlap(presented, &verified_chains[0]);
+    for (i, chain) in verified_chains.iter().enumerate().skip(1) {
+        let score = verified_chain_overlap(presented, chain);
+        if score > best_score {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    verified_chains.into_iter().nth(best_idx)
+}
+
+fn is_unknown_authority_error(reason: &str) -> bool {
+    reason.contains("unable to get local issuer certificate")
+        || reason.contains("self signed certificate")
+        || reason.contains("certificate signed by unknown authority")
+        || reason.contains("UNABLE_TO_GET_ISSUER_CERT")
+}
+
+fn verify_pkix_chain(
+    chain: &[X509],
+    trusted: &TrustedRoots,
+    now_secs: i64,
+) -> Result<Vec<X509>, CorimError> {
+    let roots = match &trusted.roots {
+        None => load_system_roots()?,
+        Some(explicit) => explicit.clone(),
+    };
+
+    let mut store_builder = X509StoreBuilder::new().map_err(CorimError::custom)?;
+    for root in &roots {
+        store_builder
+            .add_cert(root.clone())
+            .map_err(CorimError::custom)?;
+    }
+
+    let mut verify_params = X509VerifyParam::new().map_err(CorimError::custom)?;
+    verify_params.set_time(now_secs);
+    verify_params
+        .set_purpose(X509PurposeId::ANY)
+        .map_err(CorimError::custom)?;
+    store_builder
+        .set_param(&verify_params)
+        .map_err(CorimError::custom)?;
+
+    let store = store_builder.build();
+    let mut ctx = openssl::x509::X509StoreContext::new().map_err(CorimError::custom)?;
+    let intermediates = intermediates_from_chain(chain)?;
+    let leaf = &chain[0];
+
+    let mut verified_chain: Vec<X509> = Vec::new();
+
+    let reason = ctx
+        .init(&store, leaf, &intermediates, |ctx| match ctx.verify_cert() {
+            Ok(true) => {
+                if let Some(chain) = ctx.chain() {
+                    verified_chain = chain.iter().map(X509Ref::to_owned).collect();
+                }
+                Ok(String::new())
+            }
+            Ok(false) => Ok(ctx.error().to_string()),
+            Err(err) => Err(err),
+        })
+        .map_err(|e| CorimError::custom(format!("x5chain verification failed: {e}")))?;
+
+    if !reason.is_empty() {
+        let msg = if is_unknown_authority_error(&reason) {
+            let anchor_hint = match trusted.roots {
+                None => "trusted roots (system CAs)",
+                Some(_) => "supplied root certificate(s)",
+            };
+            format!("x5chain verification failed: chain does not anchor to {anchor_hint}: {reason}")
+        } else {
+            format!("x5chain verification failed: {reason}")
+        };
+        return Err(CorimError::custom(msg));
+    }
+
+    if verified_chain.is_empty() {
+        return Err(CorimError::custom(
+            "x5chain verification failed: no verified chain",
+        ));
+    }
+
+    select_verified_chain(chain, vec![verified_chain]).ok_or_else(|| {
+        CorimError::custom("x5chain verification failed: no verified chain")
+    })
+}
+
 fn validate_signing_certificate(cert: &X509Ref) -> Result<(), CorimError> {
     let der = cert
         .to_der()
@@ -370,57 +490,19 @@ fn validate_signing_certificate(cert: &X509Ref) -> Result<(), CorimError> {
     Ok(())
 }
 
-fn verify_pkix(
-    leaf: &X509Ref,
-    intermediates: &Stack<X509>,
+fn verify_x509_chain_trust_internal(
+    chain: &[X509],
     trusted: &TrustedRoots,
-    now_secs: i64,
 ) -> Result<Vec<X509>, CorimError> {
-    let mut store_builder = X509StoreBuilder::new().map_err(CorimError::custom)?;
-    for root in &trusted.roots {
-        store_builder
-            .add_cert(root.clone())
-            .map_err(CorimError::custom)?;
+    if chain.is_empty() {
+        return Err(CorimError::custom("empty chain"));
     }
 
-    let mut verify_params = X509VerifyParam::new().map_err(CorimError::custom)?;
-    verify_params.set_time(now_secs);
-    verify_params
-        .set_purpose(X509PurposeId::ANY)
-        .map_err(CorimError::custom)?;
-    store_builder
-        .set_param(&verify_params)
-        .map_err(CorimError::custom)?;
+    validate_signing_certificate(&chain[0])?;
 
-    let store = store_builder.build();
-    let mut ctx = openssl::x509::X509StoreContext::new().map_err(CorimError::custom)?;
-
-    let mut verified_chain: Vec<X509> = Vec::new();
-
-    let reason = ctx
-        .init(&store, leaf, intermediates, |ctx| match ctx.verify_cert() {
-            Ok(true) => {
-                if let Some(chain) = ctx.chain() {
-                    verified_chain = chain.iter().map(X509Ref::to_owned).collect();
-                }
-                Ok(String::new())
-            }
-            Ok(false) => Ok(ctx.error().to_string()),
-            Err(err) => Err(err),
-        })
-        .map_err(|e| CorimError::custom(format!("x5chain verification failed: {e}")))?;
-
-    if !reason.is_empty() {
-        return Err(CorimError::custom(format!(
-            "x5chain verification failed: {reason}"
-        )));
-    }
-
-    if verified_chain.is_empty() {
-        return Err(CorimError::custom(
-            "x5chain verification failed: no verified chain",
-        ));
-    }
+    let now_secs = validation_time(trusted)?;
+    let verified_chain = verify_pkix_chain(chain, trusted, now_secs)?;
+    check_revocation(&verified_chain, &trusted.crls, now_secs)?;
 
     Ok(verified_chain)
 }
@@ -443,10 +525,6 @@ pub fn verify_x509_chain_trust(
     chain_ders: &[impl AsRef<[u8]>],
     trusted: &TrustedRoots,
 ) -> Result<(), CorimError> {
-    if chain_ders.is_empty() {
-        return Err(CorimError::custom("empty chain"));
-    }
-
     let chain: Vec<X509> = chain_ders
         .iter()
         .map(|der| {
@@ -455,14 +533,7 @@ pub fn verify_x509_chain_trust(
         })
         .collect::<std::result::Result<Vec<_>, CorimError>>()?;
 
-    validate_signing_certificate(&chain[0])?;
-
-    let now_secs = validation_time(trusted)?;
-    let intermediates = intermediates_from_chain(&chain)?;
-    let verified_chain = verify_pkix(&chain[0], &intermediates, trusted, now_secs)?;
-    check_revocation(&verified_chain, &trusted.crls, now_secs)?;
-
-    Ok(())
+    verify_x509_chain_trust_internal(&chain, trusted).map(|_| ())
 }
 
 impl SignedCorim<'_> {
@@ -486,10 +557,20 @@ impl SignedCorim<'_> {
     /// trust flags do not apply on that path.
     pub fn verify_x509_chain_trust(&self, trusted: &TrustedRoots) -> Result<(), CorimError> {
         let chain_ders = self.x509_certificate_ders()?;
-        verify_x509_chain_trust(&chain_ders, trusted)?;
+        let chain: Vec<X509> = chain_ders
+            .iter()
+            .map(|der| {
+                X509::from_der(der)
+                    .map_err(|e| CorimError::custom(format!("parsing x5chain cert: {e}")))
+            })
+            .collect::<std::result::Result<Vec<_>, CorimError>>()?;
 
-        let verifier = OpensslSigner::public_key_from_x509_der(&chain_ders[0])?;
+        let verified_chain = verify_x509_chain_trust_internal(&chain, trusted)?;
+
+        let leaf_der = cert_der(&verified_chain[0])?;
+        let verifier = OpensslSigner::public_key_from_x509_der(&leaf_der)?;
         self.verify_signature(verifier)
+            .map_err(|err| CorimError::custom(format!("x5chain: COSE signature verification failed: {err}")))
     }
 }
 
@@ -601,6 +682,54 @@ mod tests {
     }
 
     #[test]
+    fn select_verified_chain_prefers_presented_overlap() {
+        let leaf = load_cert("leaf.cert.pem");
+        let inter = load_cert("int.cert.pem");
+        let root_a = load_cert("root.cert.pem");
+        let root_b = crl_helpers::make_ca().0;
+
+        let presented = vec![leaf.clone(), inter.clone(), root_a.clone()];
+        let chains = vec![
+            vec![leaf.clone(), inter.clone(), root_b],
+            vec![leaf, inter, root_a.clone()],
+        ];
+
+        let selected = select_verified_chain(&presented, chains).expect("selected chain");
+        assert_eq!(
+            selected.last().unwrap().to_der().unwrap(),
+            root_a.to_der().unwrap()
+        );
+    }
+
+    #[test]
+    fn check_revocation_skips_trust_anchor() {
+        use crl_helpers::{make_ca, make_crl_revoking_leaf, make_leaf};
+
+        let (ca, ca_key) = make_ca();
+        let leaf = make_leaf(&ca, &ca_key);
+        let crl = make_crl_revoking_leaf(&ca, &ca_key, &ca);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        check_revocation(&[leaf, ca], &[crl], now)
+            .expect("trust anchor must not be checked as a CRL subject");
+    }
+
+    #[test]
+    fn verify_x509_chain_trust_unknown_root_hint() {
+        let chain = chain_ders(&["leaf.cert.pem", "int.cert.pem"]);
+        let trusted = TrustedRoots::with_roots(Vec::new());
+        let err = verify_x509_chain_trust(&chain, &trusted).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("chain does not anchor to supplied root certificate(s)"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn verify_x509_chain_ok() {
         verify_x509_chain(&[load_cert("int.cert.pem"), load_cert("root.cert.pem")]).unwrap();
     }
@@ -673,7 +802,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(trusted.roots.len(), 1);
+        assert_eq!(trusted.roots.as_ref().expect("explicit roots").len(), 1);
     }
 
     #[test]
@@ -764,6 +893,8 @@ mod tests {
 
         let root_count = trusted
             .roots
+            .as_ref()
+            .expect("explicit roots")
             .iter()
             .filter(|cert| cert.to_der().unwrap() == root_der)
             .count();
