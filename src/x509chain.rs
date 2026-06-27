@@ -13,8 +13,9 @@
 //! are supplied, only those anchors are trusted (explicit override; no merge with
 //! system roots).
 //!
-//! **CRL policy:** no CRL paths → skip revocation; non-empty CRL list → strict
-//! `CRL_CHECK_ALL` semantics post-PKIX (differs from Go per-issuer fail-open).
+//! **CRL policy:** no CRL paths → skip revocation; non-empty CRL list → post-PKIX
+//! checks governed by [`CrlPolicy`] (default [`CrlPolicy::Strict`], OpenSSL
+//! `CRL_CHECK_ALL`-equivalent).
 //!
 //! For verification with an external JWK or PEM key (no PKIX), use
 //! [`SignedCorim::verify_signature`] in the `corim` module instead.
@@ -25,10 +26,9 @@
 //!   `Verify` call; `selectVerifiedChain` picks the path with the most DER overlap with
 //!   the presented x5chain. OpenSSL `verify_cert` returns **one** chain per call; this
 //!   module uses that result directly (typical single-path deployments match Go).
-//! - **CRL when `crls` is non-empty:** Go `checkChainRevocation` **fail-opens** (skip
-//!   issuers with no matching CRL). This module **fail-closes** with
-//!   `CRL_CHECK_ALL`-equivalent post-PKIX checks (every in-chain issuer must have a
-//!   valid matching CRL). Empty `crls` → no revocation check in both cases.
+//! - **CRL when `crls` is non-empty:** default [`CrlPolicy::Strict`] requires every
+//!   in-chain issuer to have a valid matching CRL. [`CrlPolicy::Permissive`] skips
+//!   issuers with no matching CRL. Empty `crls` → no revocation check in both cases.
 
 use crate::core::{Bytes, OneOrMore};
 use crate::corim::SignedCorim;
@@ -53,17 +53,29 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Maximum DER size for a single x5chain certificate (signing cert or one intermediate TLV).
 const X5CHAIN_MAX_CERT_DER_BYTES: usize = 256 * 1024;
 
+/// How missing issuer CRLs are handled when `TrustAnchors::crls` is non-empty.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CrlPolicy {
+    /// Every in-chain issuer must have a valid matching CRL (OpenSSL `CRL_CHECK_ALL`).
+    /// This is the default.
+    #[default]
+    Strict,
+    /// Skip revocation for in-chain issuers with no matching CRL. When matching CRLs
+    /// exist but are all invalid, verification still fails.
+    Permissive,
+}
+
 /// Trust anchors and optional CRLs for x5chain validation.
 ///
 /// `anchors == None` loads system anchors at verify time (like Go `TrustAnchors{Pool: nil}`).
 /// `anchors == Some(vec)` uses only explicit anchors; an empty vector is explicit-trust-only.
 ///
-/// `crls` empty → skip revocation. `crls` non-empty → strict post-PKIX
-/// `CRL_CHECK_ALL`-equivalent checks (each in-chain issuer must have a valid matching CRL).
-/// Prefer building via [`load_trust_anchors`].
+/// `crls` empty → skip revocation. `crls` non-empty → post-PKIX checks per [`CrlPolicy`]
+/// (default [`CrlPolicy::Strict`]). Prefer building via [`load_trust_anchors`].
 pub struct TrustAnchors {
     pub(crate) anchors: Option<Vec<X509>>,
     pub(crate) crls: Vec<X509Crl>,
+    pub(crate) crl_policy: CrlPolicy,
     pub(crate) current_time: Option<i64>,
 }
 
@@ -71,6 +83,12 @@ impl TrustAnchors {
     /// Override validation time (Unix seconds). Used mainly in tests.
     pub fn with_validation_time(mut self, unix_secs: i64) -> Self {
         self.current_time = Some(unix_secs);
+        self
+    }
+
+    /// Override CRL policy when `crls` is non-empty. Default is [`CrlPolicy::Strict`].
+    pub fn with_crl_policy(mut self, policy: CrlPolicy) -> Self {
+        self.crl_policy = policy;
         self
     }
 
@@ -101,6 +119,7 @@ impl TrustAnchors {
         Ok(Self {
             anchors: Some(anchors),
             crls,
+            crl_policy: CrlPolicy::default(),
             current_time: None,
         })
     }
@@ -110,6 +129,7 @@ impl TrustAnchors {
         Self {
             anchors: Some(anchors),
             crls: Vec::new(),
+            crl_policy: CrlPolicy::default(),
             current_time: None,
         }
     }
@@ -119,6 +139,7 @@ impl TrustAnchors {
         Self {
             anchors: Some(anchors),
             crls,
+            crl_policy: CrlPolicy::default(),
             current_time: None,
         }
     }
@@ -180,7 +201,8 @@ fn append_trust_anchors_from_der_or_pem(
 /// trust store. When non-empty, only those anchors are trusted (override; no system merge).
 ///
 /// When `crl_paths` is empty, no revocation checks run. When non-empty, loaded CRLs
-/// enable strict post-PKIX `CRL_CHECK_ALL`-equivalent checks (see [`TrustAnchors`]).
+/// enable post-PKIX checks per [`CrlPolicy`] (default [`CrlPolicy::Strict`]; see
+/// [`TrustAnchors`]).
 ///
 /// Each anchor or CRL path may be DER or PEM. PEM anchor files may contain multiple
 /// certificates (via [`X509::stack_from_pem`]); DER anchor files hold a single
@@ -230,6 +252,7 @@ where
     Ok(TrustAnchors {
         anchors,
         crls,
+        crl_policy: CrlPolicy::default(),
         current_time: None,
     })
 }
@@ -367,7 +390,7 @@ fn try_verify_pkix_with_roots(
 }
 
 /// Map a PKIX failure to a [`CorimError`]. Revocation and CRL validity errors are
-/// returned from post-PKIX [`check_chain_revocation_strict`], not from OpenSSL PKIX.
+/// returned from post-PKIX [`check_chain_revocation`], not from OpenSSL PKIX.
 fn pkix_failure_error(failure: &PkixFailure) -> CorimError {
     match failure {
         PkixFailure::VerifyError(result) => match result.as_raw() {
@@ -439,15 +462,17 @@ fn is_serial_revoked(cert: &X509Ref, crl: &X509CrlRef) -> bool {
     )
 }
 
-/// Post-PKIX strict CRL check (`CRL_CHECK_ALL`-equivalent when `crls` is non-empty).
+/// Post-PKIX CRL check when `crls` is non-empty.
 ///
 /// For each `(certificate, issuer)` pair in the verified chain (excluding the trust
-/// anchor at the chain end), require at least one **valid** CRL in `crls` signed by
-/// `issuer`. Missing issuer CRL → `unable to get certificate CRL`. Revoked serial →
-/// [`CorimError::X5chainCertificateRevoked`]. Empty `crls` → no-op.
-fn check_chain_revocation_strict(
+/// anchor at the chain end), [`CrlPolicy::Strict`] requires at least one **valid** CRL
+/// in `crls` signed by `issuer`. [`CrlPolicy::Permissive`] skips issuers with no matching
+/// CRL. Missing issuer CRL under strict policy → `unable to get certificate CRL`.
+/// Revoked serial → [`CorimError::X5chainCertificateRevoked`]. Empty `crls` → no-op.
+fn check_chain_revocation(
     chain: &[X509],
     crls: &[X509Crl],
+    policy: CrlPolicy,
     now_secs: i64,
 ) -> Result<(), CorimError> {
     if crls.is_empty() {
@@ -459,6 +484,10 @@ fn check_chain_revocation_strict(
         let issuer = &chain[i + 1];
         let issuer_crls = filter_crls_for_issuer(issuer, crls);
         if issuer_crls.is_empty() {
+            if policy == CrlPolicy::Permissive {
+                continue;
+            }
+
             return Err(CorimError::X5chainVerificationFailed(
                 "unable to get certificate CRL".into(),
             ));
@@ -484,7 +513,9 @@ fn check_chain_revocation_strict(
 
         if !valid_crl_found {
             return Err(validity_err.unwrap_or_else(|| {
-                CorimError::X5chainVerificationFailed("no valid CRL for certificate issuer".into())
+                CorimError::X5chainVerificationFailed(
+                    "no valid CRL for certificate issuer".into(),
+                )
             }));
         }
     }
@@ -588,8 +619,13 @@ fn verify_with_x5chain_internal(
 
     let now_secs = validation_time(anchors)?;
     let verified_chain = verify_pkix_chain(&chain, anchors, now_secs)?;
-    // Strict CRL only when `anchors.crls` is non-empty (see `check_chain_revocation_strict`).
-    check_chain_revocation_strict(&verified_chain, &anchors.crls, now_secs)?;
+    // CRL only when `anchors.crls` is non-empty (see `check_chain_revocation`).
+    check_chain_revocation(
+        &verified_chain,
+        &anchors.crls,
+        anchors.crl_policy,
+        now_secs,
+    )?;
 
     Ok(verified_chain)
 }
@@ -1696,6 +1732,21 @@ mod tests {
             matches!(err, CorimError::X5chainCrlNotYetValid),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn verify_with_x5chain_permissive_skips_missing_issuer_crl() {
+        use crl_helpers::{make_ca_named, make_leaf, make_valid_crl};
+
+        let (chain_ca, chain_ca_key) = make_ca_named("Chain CA");
+        let (leaf, _) = make_leaf(&chain_ca, &chain_ca_key);
+        let (unrelated_ca, unrelated_key) = make_ca_named("Unrelated CA");
+        let crl = make_valid_crl(&unrelated_ca, &unrelated_key);
+        let chain = vec![leaf.to_der().unwrap(), chain_ca.to_der().unwrap()];
+        let anchors = TrustAnchors::with_anchors_and_crls(vec![chain_ca.clone()], vec![crl])
+            .with_crl_policy(CrlPolicy::Permissive);
+
+        verify_with_x5chain(&chain, &anchors).unwrap();
     }
 
     #[test]
