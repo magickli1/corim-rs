@@ -57,6 +57,12 @@ pub mod openssl;
 #[cfg(feature = "openssl")]
 pub use openssl::*;
 
+/// PKIX path validation and trust anchors for CoRIM x5chain verification.
+#[cfg(feature = "openssl")]
+pub mod x509chain;
+#[cfg(feature = "openssl")]
+pub use x509chain::*;
+
 /// Test utilities
 #[cfg(test)]
 pub(crate) mod test;
