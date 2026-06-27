@@ -3,8 +3,8 @@
 //! X.509 chain validation for CoRIM [`SignedCorim`] x5chain verification.
 //!
 //! This module implements PKIX path validation (RFC 5280 core checks), optional
-//! strict CRL revocation checking when CRL material is supplied (equivalent to
-//! OpenSSL `CRL_CHECK | CRL_CHECK_ALL`; applied post-PKIX because `openssl-sys`
+//! strict CRL revocation checking when CRL material is supplied (CRL_CHECK_ALL-equivalent
+//! for non-anchor certificates on the verified chain; applied post-PKIX because
 //! does not bind `X509_STORE_add_crl`), and COSE signature verification using the
 //! validated leaf certificate public key.
 //!
@@ -15,7 +15,7 @@
 //!
 //! **CRL policy:** no CRL paths → skip revocation; non-empty CRL list → post-PKIX
 //! checks governed by [`CrlPolicy`] (default [`CrlPolicy::Strict`], OpenSSL
-//! `CRL_CHECK_ALL`-equivalent).
+//! `CRL_CHECK_ALL`-equivalent for non-anchor certificates).
 //!
 //! For verification with an external JWK or PEM key (no PKIX), use
 //! [`SignedCorim::verify_signature`] in the `corim` module instead.
@@ -27,8 +27,9 @@
 //!   the presented x5chain. OpenSSL `verify_cert` returns **one** chain per call; this
 //!   module uses that result directly (typical single-path deployments match Go).
 //! - **CRL when `crls` is non-empty:** default [`CrlPolicy::Strict`] requires every
-//!   in-chain issuer to have a valid matching CRL. [`CrlPolicy::Permissive`] skips
-//!   issuers with no matching CRL. Empty `crls` → no revocation check in both cases.
+//!   non-anchor issuer on the verified chain to have a valid matching CRL.
+//!   [`CrlPolicy::Permissive`] skips issuers with no matching CRL. Empty `crls` → no
+//!   revocation check in both cases.
 
 use crate::core::{Bytes, OneOrMore};
 use crate::corim::SignedCorim;
@@ -56,8 +57,9 @@ const X5CHAIN_MAX_CERT_DER_BYTES: usize = 256 * 1024;
 /// How missing issuer CRLs are handled when `TrustAnchors::crls` is non-empty.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CrlPolicy {
-    /// Every in-chain issuer must have a valid matching CRL (OpenSSL `CRL_CHECK_ALL`).
-    /// This is the default.
+    /// Every in-chain issuer on the verified chain must have a valid matching CRL
+    /// (CRL_CHECK_ALL-equivalent for non-anchor certificates; the trust anchor at
+    /// the chain end is not checked). This is the default.
     #[default]
     Strict,
     /// Skip revocation for in-chain issuers with no matching CRL. When matching CRLs
@@ -97,7 +99,7 @@ impl TrustAnchors {
     /// Parsed anchors are stored as explicit trust (`anchors == Some(...)`); an empty
     /// `anchor_ders` slice yields explicit-trust-only (no system roots), matching
     /// `load_trust_anchors` with non-empty paths that load zero certificates.
-    /// Non-empty `crl_ders` enables strict post-PKIX revocation (see [`TrustAnchors`]).
+    /// Non-empty `crl_ders` enables post-PKIX revocation per [`CrlPolicy`] (see [`TrustAnchors`]).
     pub fn from_der_anchors_and_crls(
         anchor_ders: Vec<Vec<u8>>,
         crl_ders: Vec<Vec<u8>>,
@@ -513,9 +515,7 @@ fn check_chain_revocation(
 
         if !valid_crl_found {
             return Err(validity_err.unwrap_or_else(|| {
-                CorimError::X5chainVerificationFailed(
-                    "no valid CRL for certificate issuer".into(),
-                )
+                CorimError::X5chainVerificationFailed("no valid CRL for certificate issuer".into())
             }));
         }
     }
@@ -620,19 +620,14 @@ fn verify_with_x5chain_internal(
     let now_secs = validation_time(anchors)?;
     let verified_chain = verify_pkix_chain(&chain, anchors, now_secs)?;
     // CRL only when `anchors.crls` is non-empty (see `check_chain_revocation`).
-    check_chain_revocation(
-        &verified_chain,
-        &anchors.crls,
-        anchors.crl_policy,
-        now_secs,
-    )?;
+    check_chain_revocation(&verified_chain, &anchors.crls, anchors.crl_policy, now_secs)?;
 
     Ok(verified_chain)
 }
 
 /// Validates an x5chain using PKIX path validation against trust anchors, then strict
-/// post-PKIX revocation when `anchors.crls` is non-empty (`CRL_CHECK_ALL`-equivalent:
-/// every in-chain issuer must have a valid matching CRL). `chain_ders` must contain the
+/// post-PKIX revocation when `anchors.crls` is non-empty (CRL_CHECK_ALL-equivalent
+/// for non-anchor certificates on the verified chain). `chain_ders` must contain the
 /// leaf (signing) certificate first, followed by any intermediates.
 pub fn verify_with_x5chain(
     chain_ders: &[impl AsRef<[u8]>],
@@ -1468,8 +1463,8 @@ mod tests {
             X509Crl::from_der(crl.der()).unwrap()
         }
 
-        /// Valid CRLs for each issuer on a three-tier test chain (intermediate → leaf,
-        /// root → intermediate) required under `CRL_CHECK_ALL`.
+        /// Valid CRLs for each non-anchor issuer on a three-tier test chain
+        /// (intermediate → leaf; root → intermediate).
         pub(super) fn make_valid_chain_crls(pki: &TestPki) -> Vec<X509Crl> {
             vec![
                 make_valid_crl(&pki.intermediate, &pki.intermediate_key),
