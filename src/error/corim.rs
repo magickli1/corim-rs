@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: MIT
 
+/// Why loading a CRL file failed during trust-material setup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum X5chainCrlLoadErrorKind {
+    InvalidPemBlockType,
+    Parse(String),
+}
+
 #[derive(Debug)]
 pub enum CorimError {
     InvalidConciseTagTypeChoice,
@@ -11,6 +18,23 @@ pub enum CorimError {
     InvalidCoseKey(String),
     InvalidSignature,
     OutsideValidityPeriod,
+    X5chainHeaderNotSet,
+    X5chainEmptyChain,
+    X5chainVerificationFailed(String),
+    X5chainCertificateExpired,
+    X5chainCertificateNotYetValid,
+    X5chainCertificateRevoked,
+    X5chainCrlExpired,
+    X5chainCrlNotYetValid,
+    X5chainInvalidCertificateSignature(String),
+    X5chainSigningCertMustNotBeCa,
+    X5chainSigningCertLacksDigitalSignature,
+    X5chainUnsupportedKeyType(String),
+    X5chainCoseSignatureVerificationFailed(String),
+    X5chainCrlLoadError {
+        path: String,
+        kind: X5chainCrlLoadErrorKind,
+    },
     Custom(String),
     Unknown,
 }
@@ -58,6 +82,44 @@ impl std::fmt::Display for CorimError {
                 write!(f, "current time is outside manifest's validity period")
             }
             Self::InvalidSignature => f.write_str("invalid signature"),
+            Self::X5chainHeaderNotSet => f.write_str("x5chain: header not set in CoRIM"),
+            Self::X5chainEmptyChain => f.write_str("x5chain: empty chain"),
+            Self::X5chainVerificationFailed(reason) => {
+                write!(f, "x5chain verification failed: {reason}")
+            }
+            Self::X5chainCertificateExpired => f.write_str("x5chain: certificate has expired"),
+            Self::X5chainCertificateNotYetValid => {
+                f.write_str("x5chain: certificate is not yet valid")
+            }
+            Self::X5chainCertificateRevoked => f.write_str("x5chain: certificate revoked"),
+            Self::X5chainCrlExpired => f.write_str("x5chain: CRL has expired"),
+            Self::X5chainCrlNotYetValid => f.write_str("x5chain: CRL is not yet valid"),
+            Self::X5chainInvalidCertificateSignature(detail) => {
+                write!(f, "x5chain: {detail}")
+            }
+            Self::X5chainSigningCertMustNotBeCa => {
+                f.write_str("x5chain: signing certificate must not be a CA")
+            }
+            Self::X5chainSigningCertLacksDigitalSignature => {
+                f.write_str("x5chain: signing certificate lacks digitalSignature key usage")
+            }
+            Self::X5chainUnsupportedKeyType(detail) => {
+                write!(f, "x5chain: unsupported key type: {detail}")
+            }
+            Self::X5chainCoseSignatureVerificationFailed(detail) => {
+                write!(f, "x5chain: COSE signature verification failed: {detail}")
+            }
+            Self::X5chainCrlLoadError { path, kind } => match kind {
+                X5chainCrlLoadErrorKind::InvalidPemBlockType => {
+                    write!(
+                        f,
+                        "x5chain: parsing CRL from {path}: invalid PEM block type"
+                    )
+                }
+                X5chainCrlLoadErrorKind::Parse(detail) => {
+                    write!(f, "x5chain: parsing CRL from {path}: {detail}")
+                }
+            },
             Self::Custom(message) => f.write_str(message.as_str()),
             Self::Unknown => write!(f, "unknown CorimError encountered"),
         }
